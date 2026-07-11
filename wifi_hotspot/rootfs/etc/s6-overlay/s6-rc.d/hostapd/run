@@ -1,0 +1,7 @@
+#!/usr/bin/with-contenv bashio
+# ==============================================================================
+# Run hostapd (the access point daemon)
+# ==============================================================================
+bashio::log.info "Starting hostapd..."
+
+exec hostapd /run/hotspot/hostapd.conf

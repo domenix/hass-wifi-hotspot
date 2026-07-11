@@ -1,0 +1,32 @@
+#!/usr/bin/with-contenv bashio
+# ==============================================================================
+# Wi-Fi Hotspot: teardown. Only the AP interface is touched — the bridge and
+# the wired LAN interface are deliberately left alone so stopping the add-on
+# can never cost the device its network connectivity.
+# Best-effort: never fail the shutdown.
+# ==============================================================================
+
+readonly STATE=/run/hotspot/state
+
+if [[ ! -f "${STATE}" ]]; then
+    bashio::log.debug "No hotspot state file; nothing to tear down."
+    exit 0
+fi
+
+# shellcheck disable=SC1090
+source "${STATE}"
+
+bashio::log.info "Tearing down access point on ${IFACE} (bridge left in place)..."
+
+ip link set "${IFACE}" down 2>/dev/null || true
+
+if bashio::var.true "${NM_RELEASED:-false}"; then
+    if nmcli device set "${IFACE}" managed yes 2>/dev/null; then
+        bashio::log.info "Returned '${IFACE}' to host NetworkManager."
+    else
+        bashio::log.warning "Could not return '${IFACE}' to NetworkManager."
+    fi
+fi
+
+rm -f "${STATE}"
+bashio::log.info "Teardown complete."

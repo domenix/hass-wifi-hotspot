@@ -1,0 +1,33 @@
+name: Wi-Fi Hotspot
+version: 1.0.0
+slug: wifi_hotspot
+description: Broadcast a Wi-Fi access point bridged into your LAN — clients join your normal network
+url: https://github.com/domenix/hass-wifi-hotspot
+arch:
+  - aarch64
+  - armv7
+  - amd64
+init: false
+startup: services
+boot: auto
+host_network: true
+host_dbus: true
+privileged:
+  - NET_ADMIN
+  - NET_RAW
+options:
+  ssid: HA-Hotspot
+  wpa_passphrase: ""
+  channel: 6
+  interface: wlan0
+  lan_interface: ""
+  country_code: HU
+  log_level: warning
+schema:
+  ssid: str
+  wpa_passphrase: password
+  channel: int(1,165)
+  interface: str
+  lan_interface: str?
+  country_code: match(^[A-Z]{2}$)
+  log_level: list(debug|info|warning|error)

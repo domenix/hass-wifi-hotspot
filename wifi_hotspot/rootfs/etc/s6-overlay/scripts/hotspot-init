@@ -1,0 +1,315 @@
+#!/usr/bin/with-contenv bashio
+# ==============================================================================
+# Wi-Fi Hotspot (bridge mode): validate configuration, bridge the wired LAN
+# interface with a NetworkManager-managed bridge (keeping the device's IP), and
+# generate the hostapd configuration that puts the AP into the same bridge.
+#
+# Safety model:
+#   - The bridge connections are created with autoconnect=no; the original
+#     wired profile keeps autoconnect=yes until the bridge is VERIFIED
+#     (IP present + gateway reachable). A reboot mid-transition therefore
+#     always restores the original configuration.
+#   - On verification failure the script rolls back automatically: bridge
+#     connections are deleted and the original profile is re-activated.
+#   - Restarts take a fast path: if our bridge is already active with an
+#     IP, no network transition happens at all.
+# ==============================================================================
+set -o errexit -o pipefail
+
+readonly RUN_DIR=/run/hotspot
+readonly BR_IFACE=hotspot0
+# nmlan0 / hotspot-uplink: leftovers from add-on 2.2.x, cleaned up in setup
+
+mkdir -p "${RUN_DIR}"
+
+bashio::log.level "$(bashio::config 'log_level')"
+
+SSID=$(bashio::config 'ssid')
+PASSPHRASE=$(bashio::config 'wpa_passphrase')
+CHANNEL=$(bashio::config 'channel')
+IFACE=$(bashio::config 'interface')
+LAN_IFACE=$(bashio::config 'lan_interface')
+COUNTRY=$(bashio::config 'country_code')
+LOG_LEVEL=$(bashio::config 'log_level')
+
+# ------------------------------------------------------------------------------
+# Validation — fail fast with actionable messages
+# ------------------------------------------------------------------------------
+ssid_bytes=$(printf '%s' "${SSID}" | wc -c)
+if (( ssid_bytes < 1 || ssid_bytes > 32 )); then
+    bashio::exit.nok "'ssid' must be 1-32 bytes long (got ${ssid_bytes})."
+fi
+
+pass_len=${#PASSPHRASE}
+if (( pass_len < 8 || pass_len > 63 )); then
+    bashio::exit.nok "'wpa_passphrase' must be 8-63 characters long (WPA2 requirement, got ${pass_len}). Set it in the add-on configuration."
+fi
+
+if [[ ! -d "/sys/class/net/${IFACE}" ]]; then
+    bashio::exit.nok "Interface '${IFACE}' does not exist on the host. Available: $(cd /sys/class/net && echo *)"
+fi
+# HOTSPOT_TEST_SKIP_WIRELESS_CHECK is only set by the container test suite,
+# where no real wireless device can exist.
+if [[ -z "${HOTSPOT_TEST_SKIP_WIRELESS_CHECK:-}" ]] \
+    && [[ ! -d "/sys/class/net/${IFACE}/wireless" ]] && [[ ! -e "/sys/class/net/${IFACE}/phy80211" ]]; then
+    bashio::exit.nok "Interface '${IFACE}' is not a wireless interface."
+fi
+
+# 2.4 GHz 1-13 and common non-DFS 5 GHz channels only. DFS channels need radar
+# detection the Pi's brcmfmac firmware does not do in AP mode.
+case "${CHANNEL}" in
+    [1-9]|1[0-3]) HW_MODE=g; ENABLE_AC=false ;;
+    36|40|44|48|149|153|157|161|165) HW_MODE=a; ENABLE_AC=true ;;
+    *) bashio::exit.nok "'channel' must be 1-13 (2.4 GHz) or one of 36/40/44/48/149/153/157/161/165 (5 GHz, non-DFS). Got: ${CHANNEL}" ;;
+esac
+
+# LAN interface: explicit option or the host's default-route interface
+if ! bashio::var.has_value "${LAN_IFACE}"; then
+    LAN_IFACE=$(ip -4 route show default | awk '{ for (i=1; i<NF; i++) if ($i == "dev") { print $(i+1); exit } }')
+fi
+if ! bashio::var.has_value "${LAN_IFACE}"; then
+    bashio::exit.nok "Could not auto-detect the wired LAN interface (no default route). Set 'lan_interface' explicitly (usually eth0 or end0)."
+fi
+if [[ "${LAN_IFACE}" == "${BR_IFACE}" ]]; then
+    # Default route already points at the bridge (normal after first setup).
+    :
+elif [[ ! -d "/sys/class/net/${LAN_IFACE}" ]]; then
+    bashio::exit.nok "LAN interface '${LAN_IFACE}' does not exist."
+elif [[ -d "/sys/class/net/${LAN_IFACE}/wireless" ]] || [[ -e "/sys/class/net/${LAN_IFACE}/phy80211" ]]; then
+    bashio::exit.nok "LAN interface '${LAN_IFACE}' is wireless. Bridge mode needs a wired LAN uplink; Wi-Fi-repeater (AP+STA) is not supported."
+fi
+if [[ "${LAN_IFACE}" == "${IFACE}" ]]; then
+    bashio::exit.nok "AP interface and LAN interface are both '${IFACE}'."
+fi
+
+if ! nmcli general status > /dev/null 2>&1; then
+    bashio::exit.nok "Cannot talk to the host NetworkManager over D-Bus. This add-on requires Home Assistant OS (or a host running NetworkManager)."
+fi
+
+# Remove NM bridge profiles left behind by add-on versions before 2.1.0.
+nmcli connection delete hotspot-bridge hotspot-bridge-port > /dev/null 2>&1 || true
+
+bashio::log.info "AP: '${SSID}' on ${IFACE} channel ${CHANNEL} (${HW_MODE}), bridged to ${LAN_IFACE} via ${BR_IFACE}"
+
+# ------------------------------------------------------------------------------
+# Bridge helpers
+#
+# The bridge is a plain kernel bridge managed with iproute, NOT a
+# NetworkManager connection: HAOS configures NM with
+# unmanaged-devices=type:bridge;type:tun;driver:veth, so an NM-owned bridge
+# can never activate there. The host's IP lives directly on the bridge.
+# (An NM-managed macvlan on top of the bridge was tried instead — it kept
+# NM's connectivity check alive but broke Docker's DNAT port publishing,
+# taking down every port-mapped container. Do not reintroduce it.)
+#
+# Because no NM-managed device carries the default route, NM's connectivity
+# check would report NONE and the Supervisor would block updates with "no
+# host internet". Instead, the check is disabled at runtime over D-Bus:
+# the Supervisor treats "check disabled" (None) as unrestricted. NM re-reads
+# its config on restart, so a reboot re-enables the check automatically.
+#
+# Safety property: the wired interface is only released from NM at runtime
+# and the connectivity toggle is runtime-only — ANY reboot boots the
+# original wired configuration and the add-on simply re-bridges at startup.
+# ------------------------------------------------------------------------------
+gateway_reachable() {
+    ping -c 2 -W 3 "$1" > /dev/null 2>&1
+}
+
+set_nm_connectivity_check() {
+    # $1 = true|false. Runtime-only NM property; reverts on NM restart/reboot.
+    dbus-send --system --print-reply \
+        --dest=org.freedesktop.NetworkManager /org/freedesktop/NetworkManager \
+        org.freedesktop.DBus.Properties.Set \
+        string:org.freedesktop.NetworkManager \
+        string:ConnectivityCheckEnabled "variant:boolean:$1" > /dev/null 2>&1
+}
+
+rollback_bridge() {
+    bashio::log.error "Bridge verification failed — rolling back to the original wired configuration..."
+    ip link set "${LAN_IFACE}" nomaster 2>/dev/null || true
+    ip link delete "${BR_IFACE}" 2>/dev/null || true
+    nmcli device set "${LAN_IFACE}" managed yes 2>/dev/null || true
+    set_nm_connectivity_check true || true
+    if nmcli --wait 30 connection up "${ORIG_CON_NAME}" > /dev/null 2>&1; then
+        bashio::log.info "Original connection '${ORIG_CON_NAME}' re-activated."
+    else
+        bashio::log.error "Could not re-activate '${ORIG_CON_NAME}'. Nothing persistent was changed — power-cycle the device and it will come back with the original configuration."
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# Bridge setup (skipped when our bridge is already up and addressed)
+# ------------------------------------------------------------------------------
+# Fast path: our bridge exists with at least one port and an IPv4 address.
+# (After the first setup the default route sits on the bridge itself, so the
+# auto-detected LAN_IFACE may be the bridge — that is the expected state.)
+if [[ -n "$(ls -A "/sys/class/net/${BR_IFACE}/brif" 2>/dev/null)" ]] \
+    && ip -4 addr show dev "${BR_IFACE}" 2>/dev/null | grep -q inet; then
+    bashio::log.info "Bridge '${BR_IFACE}' already active with an IP address — no network transition needed."
+else
+    # A leftover '${BR_IFACE}' with no ports and no IPv4 address is a stale
+    # shell from an earlier failed attempt — remove it. Anything else in use
+    # is refused.
+    if [[ -d "/sys/class/net/${BR_IFACE}" ]]; then
+        if [[ -z "$(ls -A "/sys/class/net/${BR_IFACE}/brif" 2>/dev/null)" ]] \
+            && ! ip -4 addr show dev "${BR_IFACE}" 2>/dev/null | grep -q inet; then
+            bashio::log.warning "Removing stale empty bridge '${BR_IFACE}' left over from an earlier attempt."
+            ip link delete "${BR_IFACE}"
+        else
+            bashio::exit.nok "Interface '${BR_IFACE}' exists, is in use and was not set up by this add-on. Refusing to touch it."
+        fi
+    fi
+
+    if [[ "${LAN_IFACE}" == "${BR_IFACE}" ]] || [[ "${LAN_IFACE}" == "nmlan0" ]]; then
+        bashio::exit.nok "The network is in a partially-bridged state ('${LAN_IFACE}' holds the default route but the setup is incomplete). Reboot the device, then restart the add-on."
+    fi
+
+    # Identify the active NM profile currently holding the LAN interface —
+    # needed to hand the interface back on rollback.
+    ORIG_CON_NAME=$(nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null \
+        | awk -F: -v dev="${LAN_IFACE}" '$2 == dev { print $1; exit }')
+    if [[ -z "${ORIG_CON_NAME}" ]]; then
+        bashio::exit.nok "No active NetworkManager connection found on '${LAN_IFACE}'. Refusing to reconfigure an interface NetworkManager does not manage."
+    fi
+
+    # Capture the CURRENT addressing — source of truth for the takeover.
+    mapfile -t LAN_ADDRS < <(ip -4 addr show dev "${LAN_IFACE}" \
+        | awk '/inet / { print $2 }')
+    GW_IP=$(ip -4 route show default dev "${LAN_IFACE}" \
+        | awk '{ for (i=1; i<NF; i++) if ($i == "via") { print $(i+1); exit } }')
+    DNS_SERVERS=$(nmcli -g IP4.DNS device show "${LAN_IFACE}" 2>/dev/null \
+        | tr '|' ' ' | xargs || true)
+    if [[ -z "${DNS_SERVERS}" ]]; then
+        DNS_SERVERS="${GW_IP}"
+    fi
+    if (( ${#LAN_ADDRS[@]} == 0 )) || [[ -z "${GW_IP}" ]]; then
+        bashio::exit.nok "Could not read the current IPv4 address/gateway of '${LAN_IFACE}'."
+    fi
+
+    LAN_MAC=$(cat "/sys/class/net/${LAN_IFACE}/address")
+
+    bashio::log.notice "Bridging '${LAN_IFACE}' into '${BR_IFACE}' (${LAN_ADDRS[0]}, gw ${GW_IP}). Network will blip for a moment."
+    bashio::log.notice "Safety: no boot-time network settings are changed — a reboot always restores the plain wired configuration."
+
+    # Remove leftovers from add-on versions 2.0.x-2.2.x.
+    nmcli connection delete hotspot-uplink > /dev/null 2>&1 || true
+    ip link delete nmlan0 > /dev/null 2>&1 || true
+
+    set +o errexit
+    (
+        set -o errexit
+        ip link add "${BR_IFACE}" type bridge
+        ip link set "${BR_IFACE}" address "${LAN_MAC}"
+        ip link set "${BR_IFACE}" up
+        # Release the wired interface from NM (runtime-only) and move its
+        # addressing onto the bridge — this is the moment the network blips.
+        nmcli device set "${LAN_IFACE}" managed no
+        ip addr flush dev "${LAN_IFACE}"
+        ip link set "${LAN_IFACE}" master "${BR_IFACE}"
+        ip link set "${LAN_IFACE}" up
+        for addr in "${LAN_ADDRS[@]}"; do
+            ip addr add "${addr}" brd + dev "${BR_IFACE}"
+        done
+        ip route replace default via "${GW_IP}" dev "${BR_IFACE}"
+    )
+    setup_rc=$?
+    set -o errexit
+
+    if (( setup_rc != 0 )) || ! gateway_reachable "${GW_IP}"; then
+        rollback_bridge
+        bashio::exit.nok "Bridge setup failed or the gateway became unreachable (see log above). Original configuration restored."
+    fi
+
+    {
+        echo "{\"original_connection_name\": \"${ORIG_CON_NAME}\","
+        echo " \"lan_interface\": \"${LAN_IFACE}\","
+        echo " \"addresses\": \"${LAN_ADDRS[*]}\","
+        echo " \"gateway\": \"${GW_IP}\","
+        echo " \"dns\": \"${DNS_SERVERS}\"}"
+    } > /data/bridge-state.json
+
+    bashio::log.info "Bridge verified: ${LAN_ADDRS[0]} on ${BR_IFACE}, gateway ${GW_IP} reachable."
+fi
+
+# No NM-managed device carries the default route now; disable NM's
+# connectivity check (runtime-only) so the Supervisor does not block
+# operations with "no host internet". A reboot re-enables it.
+if set_nm_connectivity_check false; then
+    bashio::log.info "Disabled NetworkManager connectivity check (runtime-only; Supervisor treats it as unrestricted)."
+else
+    bashio::log.warning "Could not disable the NM connectivity check — Supervisor may report 'no host internet' while the hotspot runs."
+fi
+
+# Docker sets net.bridge.bridge-nf-call-iptables=1, which sends bridged L2
+# frames through the iptables FORWARD chain — where Docker's default policy
+# is DROP. Allow traffic that stays inside our bridge (idempotent).
+iptables -C FORWARD -i "${BR_IFACE}" -o "${BR_IFACE}" -j ACCEPT 2>/dev/null \
+    || iptables -I FORWARD 1 -i "${BR_IFACE}" -o "${BR_IFACE}" -j ACCEPT
+
+# ------------------------------------------------------------------------------
+# Release the AP interface from NetworkManager, unblock radio
+# ------------------------------------------------------------------------------
+if nmcli -t -f DEVICE,STATE device status 2>/dev/null | grep -q "^${IFACE}:"; then
+    if nmcli device set "${IFACE}" managed no 2>/dev/null; then
+        bashio::log.info "Set '${IFACE}' unmanaged in host NetworkManager."
+        NM_RELEASED=true
+        sleep 1
+    else
+        bashio::log.warning "Could not set '${IFACE}' unmanaged in NetworkManager; continuing anyway."
+        NM_RELEASED=false
+    fi
+else
+    NM_RELEASED=false
+fi
+
+if [[ -e /dev/rfkill ]]; then
+    rfkill unblock wifi 2>/dev/null || true
+fi
+
+ip addr flush dev "${IFACE}" 2>/dev/null || true
+ip link set "${IFACE}" up
+
+# ------------------------------------------------------------------------------
+# hostapd configuration — hostapd itself adds the AP interface to the bridge
+# ------------------------------------------------------------------------------
+case "${LOG_LEVEL}" in
+    debug)   HOSTAPD_LOG=1 ;;
+    info)    HOSTAPD_LOG=2 ;;
+    *)       HOSTAPD_LOG=4 ;;
+esac
+
+{
+    echo "interface=${IFACE}"
+    echo "bridge=${BR_IFACE}"
+    echo "driver=nl80211"
+    echo "ctrl_interface=${RUN_DIR}/hostapd"
+    echo "ssid=${SSID}"
+    echo "country_code=${COUNTRY}"
+    echo "ieee80211d=1"
+    echo "hw_mode=${HW_MODE}"
+    echo "channel=${CHANNEL}"
+    echo "ieee80211n=1"
+    if bashio::var.true "${ENABLE_AC}"; then
+        echo "ieee80211ac=1"
+    fi
+    echo "wmm_enabled=1"
+    echo "auth_algs=1"
+    echo "wpa=2"
+    echo "wpa_key_mgmt=WPA-PSK"
+    echo "rsn_pairwise=CCMP"
+    echo "wpa_passphrase=${PASSPHRASE}"
+    echo "macaddr_acl=0"
+    echo "logger_syslog=0"
+    echo "logger_stdout=-1"
+    echo "logger_stdout_level=${HOSTAPD_LOG}"
+} > "${RUN_DIR}/hostapd.conf"
+chmod 600 "${RUN_DIR}/hostapd.conf"
+
+# State for the teardown script
+{
+    echo "IFACE=${IFACE}"
+    echo "NM_RELEASED=${NM_RELEASED}"
+} > "${RUN_DIR}/state"
+
+bashio::log.info "Network prepared; starting hostapd."

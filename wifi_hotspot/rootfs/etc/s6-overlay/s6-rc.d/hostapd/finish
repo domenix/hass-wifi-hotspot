@@ -1,0 +1,12 @@
+#!/usr/bin/with-contenv bashio
+# ==============================================================================
+# Stop the whole add-on when hostapd exits abnormally, instead of
+# crash-looping in the background.
+# ==============================================================================
+declare -r exit_code="${1}"
+
+if [[ "${exit_code}" -ne 0 ]] && [[ "${exit_code}" -ne 256 ]]; then
+    bashio::log.error "hostapd exited with code ${exit_code}; stopping add-on. Check the log above for the reason."
+    echo "${exit_code}" > /run/s6-linux-init-container-results/exitcode
+    exec /run/s6/basedir/bin/halt
+fi

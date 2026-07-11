@@ -1,0 +1,31 @@
+configuration:
+  ssid:
+    name: SSID
+    description: >-
+      Name of the Wi-Fi network to broadcast (1-32 characters).
+  wpa_passphrase:
+    name: Wi-Fi password
+    description: >-
+      WPA2 passphrase clients use to connect. Must be 8-63 characters.
+  channel:
+    name: Wi-Fi channel
+    description: >-
+      1-13 for 2.4 GHz, or 36/40/44/48/149/153/157/161/165 for 5 GHz
+      (non-DFS). 2.4 GHz has better range, 5 GHz better speed.
+  interface:
+    name: Access point interface
+    description: >-
+      Wireless interface to broadcast on. On a Raspberry Pi this is wlan0.
+  lan_interface:
+    name: Wired LAN interface
+    description: >-
+      Wired interface that gets bridged with the access point. Leave empty
+      to auto-detect from the default route (usually eth0 or end0).
+  country_code:
+    name: Country code
+    description: >-
+      Two-letter regulatory country code (ISO 3166-1, e.g. HU, DE, US).
+      Controls allowed channels and transmit power.
+  log_level:
+    name: Log level
+    description: Controls the verbosity of the add-on's log output.
